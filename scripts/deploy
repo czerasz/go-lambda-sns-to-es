@@ -1,0 +1,178 @@
+#!/bin/bash
+
+# set -eu
+# set -e
+
+script_directory="$( cd "$( dirname "$0" )" && pwd )"
+project_directory="${script_directory}/.."
+tmp_directory="${project_directory}/.tmp"
+
+# Create temporary directory if it doesn't exist
+if [ ! -d "${tmp_directory}" ]; then
+  mkdir "${tmp_directory}"
+fi
+
+deployment_environment='development'
+artifact_version='latest'
+
+if [ -z "$FUNCTION_NAME" ]; then
+  echo "[Error] Missing required FUNCTION_NAME environment variable" >&2
+  exit 1
+fi
+
+if [ -z "$AWS_REGION" ]; then
+  echo "[Error] Missing required AWS_REGION environment variable" >&2
+  exit 1
+fi
+
+if [ -z "$AWS_ACCESS_KEY_ID" ]; then
+  echo "[Error] Missing required AWS_ACCESS_KEY_ID environment variable" >&2
+  exit 1
+fi
+
+if [ -z "$AWS_SECRET_ACCESS_KEY" ]; then
+  echo "[Error] Missing required AWS_SECRET_ACCESS_KEY environment variable" >&2
+  exit 1
+fi
+
+if [ -z "$ES_URL" ]; then
+  echo "[Error] Missing required ES_URL environment variable" >&2
+  exit 1
+fi
+
+if [ -z "$AWS_ROLE_ARN" ]; then
+  echo "[Error] Missing required AWS_ROLE_ARN environment variable" >&2
+  exit 1
+fi
+
+if ! [ -x "$(command -v git)" ]; then
+  echo '[Error] git is not installed' >&2
+  exit 1
+fi
+
+if ! [ -x "$(command -v jq)" ]; then
+  echo '[Error] jq is not installed' >&2
+  exit 1
+fi
+
+
+if [ -z $CI ]; then
+  echo "CI environment variable NOT set"
+
+  if [ ! -z $OVERWRITE_ENV ]; then
+    deployment_environment="${OVERWRITE_ENV}"
+  fi
+
+  if [ ! -z $OVERWRITE_ARTIFACT ]; then
+    artifact_version="${OVERWRITE_ARTIFACT}"
+  else
+    # # Get current branch name
+    # artifact_version=$(git rev-parse --abbrev-ref HEAD)
+    # Get current commit hash
+    artifact_version=$(git rev-parse HEAD)
+  fi
+elif [ "$TRAVIS_CI" = "true" ]; then
+  artifact_version="${TRAVIS_COMMIT}"
+
+  if [ "$TRAVIS_PULL_REQUEST" = "false" ]; then
+    if [ "$TRAVIS_BRANCH" = "master" ]; then
+      deployment_environment="testing"
+    elif [ ! -z "${TRAVIS_TAG}" ]; then
+      deployment_environment="production"
+      artifact_version="${TRAVIS_TAG}"
+    fi
+  else
+    deployment_environment="development"
+    artifact_version="${TRAVIS_BRANCH}"
+  fi
+fi
+echo "[INFO] deployment_environment: ${deployment_environment}"
+echo "[INFO] artifact version: ${artifact_version}"
+
+
+cd "${project_directory}"
+
+git_remote=$(git remote -v | grep fetch | grep -Eo 'git.*git' | head -n1)
+description="YOUR MANUAL CHANGES WILL BE OVERWRITTEN! This function is deployed automatically.\nFind more details the repository: ${git_remote}"
+
+if [ ! -z "$DESCRIPTION" ]; then
+  description="${description}\n\n$DESCRIPTION"
+fi
+
+
+# # TODO: enable golint
+# # golint -set_exit_status
+
+# echo "Run: go vet"
+# go vet ./...
+
+# # Test
+# echo "Run: go test"
+# go test ./...
+
+# "${script_directory}/build"
+
+aws lambda get-function-configuration --function-name "${FUNCTION_NAME}" > /dev/null 2>&1
+if [ ! $? -eq 0 ]; then
+  # Function does not exist, so create the function
+
+  # env_vars is used to form variables block used by the function
+  env_vars="ES_URL=${ES_URL}"
+
+  # # If ES_INDEX_TEMPLATE is set append it to the env_vars
+  # if [ ! -z "${ES_INDEX_TEMPLATE}" ]; then
+  #   env_vars="${env_vars},ES_INDEX_TEMPLATE=${ES_INDEX_TEMPLATE}"
+  # fi
+
+  # If ES_DOC_TYPE_NAME is set append it to the env_vars
+  if [ ! -z "${ES_DOC_TYPE_NAME}" ]; then
+    env_vars="${env_vars},ES_DOC_TYPE_NAME=${ES_DOC_TYPE_NAME}"
+  fi
+
+  if [ "${DEBUG}" = "true" ]; then
+    env_vars="${env_vars},DEBUG=true"
+  fi
+
+  aws lambda create-function --function-name "${FUNCTION_NAME}" \
+    --description "${description}" \
+    --runtime go1.x \
+    --handler main \
+    --environment "Variables={${env_vars}}" \
+    --memory-size 128 \
+    --publish \
+    --role "${AWS_ROLE_ARN}" \
+    --zip-file "fileb://${project_directory}/dist/deployment.zip" \
+  > "${tmp_directory}/create-or-update-function.stdout"
+else
+  aws lambda update-function-code --function-name "${FUNCTION_NAME}" \
+      --zip-file "fileb://${project_directory}/dist/deployment.zip" \
+  > "${tmp_directory}/create-or-update-function.stdout"
+fi
+
+function_code_sha256=$(cat "${tmp_directory}/create-or-update-function.stdout" | jq -r '.CodeSha256')
+
+echo "[INFO] Function CodeSha256: ${function_code_sha256}"
+
+# Publish Lambda
+aws lambda publish-version --function-name "${FUNCTION_NAME}" \
+  --code-sha-256="${function_code_sha256}" \
+  --description "${artifact_version}" \
+  > "${tmp_directory}/publish-version.stdout"
+
+version=${cat "${tmp_directory}/publish-version.stdout" | jq -r '.Version'}
+
+# Check if environment alias already exists
+aws lambda get-alias --function-name "${FUNCTION_NAME}" --name "${deployment_environment}"
+if [ ! $? -eq 0 ]; then
+  aws lambda create-alias --function-name "${FUNCTION_NAME}" \
+      --name "${deployment_environment}" \
+      --description "${deployment_environment} environment" \
+      --function-version "${version}"
+else
+  aws lambda update-alias --function-name "${FUNCTION_NAME}" \
+      --name "${deployment_environment}" \
+      --description "${deployment_environment} environment" \
+      --function-version "${version}"
+fi
+
+# aws lambda invoke --function UpdateMovie --payload file://input.json result.json
